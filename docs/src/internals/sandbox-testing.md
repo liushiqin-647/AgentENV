@@ -734,8 +734,13 @@ AENV_BENCH_CONCURRENCY=2 \
   cargo bench -p agentenv-benchmarks --bench snapshot -- fresh_start_
 ```
 
-The filter runs both measurements. The default runner takes bounded samples;
-set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY` defaults to twice
-the available CPU parallelism, up to 50. A failed operation fails the batch;
-the benchmark attempts to stop any remaining sandboxes and reports cleanup
-errors.
+The filter runs both measurements. A filter that exactly matches one benchmark
+case name (for example `snapshot_creation`) runs only that case; any other
+filter keeps substring matching, so a prefix such as `fresh_start_` selects a
+whole family. The first run records the default rootfs image's converted config
+in `$AENV_HOME_PATH/benchmarks/rootfs-image.json` and later runs reuse it, so a
+warm image cache does not contact the registry again. The default runner takes
+bounded samples; set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY`
+defaults to twice the available CPU parallelism, up to 50. A failed operation
+fails the batch; the benchmark attempts to stop any remaining sandboxes and
+reports cleanup errors.

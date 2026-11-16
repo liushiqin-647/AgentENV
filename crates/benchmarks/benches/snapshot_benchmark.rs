@@ -6,8 +6,9 @@ use agentenv::sandbox::{
 use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
+use serde::{Deserialize, Serialize};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Barrier,
@@ -18,6 +19,35 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::OnceCell;
 
 static DEFAULT_ROOTFS_IMAGE_CONFIG: OnceCell<PathBuf> = OnceCell::const_new();
+
+/// Location of the benchmark-local record that maps the configured rootfs
+/// image reference to its converted overlaybd config. Reusing it keeps
+/// repeated benchmark runs off the registry when the image is already cached.
+const ROOTFS_IMAGE_CACHE_DIR: &str = "benchmarks";
+const ROOTFS_IMAGE_CACHE_FILE: &str = "rootfs-image.json";
+
+/// Benchmark case names that may be selected individually. A filter equal to
+/// one of these runs only that case; any other filter keeps the substring
+/// match so prefixes such as `fresh_start_` still select a whole family.
+const BENCHMARK_NAMES: &[&str] = &[
+    "snapshot_creation",
+    "snapshot_creation_1gdisk",
+    "snapshot_creation_1gmem",
+    "snapshot_resume_cold",
+    "snapshot_resume",
+    "concurrent_resume",
+    "concurrent_resume_throughput",
+    "concurrent_snapshot_capture_throughput",
+    "concurrent_pause_throughput",
+    "concurrent_fresh_start_throughput",
+    "concurrent_fresh_start_stop_throughput",
+];
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedRootfsImage {
+    image_ref: String,
+    overlaybd_config_path: PathBuf,
+}
 
 const FULL_SAMPLE_SIZE: usize = 10;
 const FULL_WARM_UP_TIME: Duration = Duration::from_secs(3);
@@ -87,23 +117,19 @@ fn cleanup_settle_time() -> Duration {
 }
 
 fn should_run(name: &str, filters: &[String]) -> bool {
-    filters.is_empty() || filters.iter().any(|filter| name.contains(filter))
+    filters.is_empty()
+        || filters.iter().any(|filter| {
+            filter == name
+                || (!BENCHMARK_NAMES.contains(&filter.as_str()) && name.contains(filter))
+        })
 }
 
 fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--list") {
-        println!("snapshot_creation");
-        println!("snapshot_creation_1gdisk");
-        println!("snapshot_creation_1gmem");
-        println!("snapshot_resume_cold");
-        println!("snapshot_resume");
-        println!("concurrent_resume");
-        println!("concurrent_resume_throughput");
-        println!("concurrent_snapshot_capture_throughput");
-        println!("concurrent_pause_throughput");
-        println!("concurrent_fresh_start_throughput");
-        println!("concurrent_fresh_start_stop_throughput");
+        for name in BENCHMARK_NAMES {
+            println!("{name}");
+        }
         return Ok(None);
     }
 
@@ -223,16 +249,77 @@ async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
     Ok(sandbox)
 }
 
+fn rootfs_image_cache_path(app_config: &agentenv::cfg::AppConfig) -> PathBuf {
+    app_config
+        .home_path
+        .join(ROOTFS_IMAGE_CACHE_DIR)
+        .join(ROOTFS_IMAGE_CACHE_FILE)
+}
+
+fn cached_rootfs_image_config(
+    app_config: &agentenv::cfg::AppConfig,
+    image_ref: &str,
+) -> Option<PathBuf> {
+    let cache_path = rootfs_image_cache_path(app_config);
+    let bytes = std::fs::read(&cache_path).ok()?;
+    let cached: CachedRootfsImage = serde_json::from_slice(&bytes).ok()?;
+    if cached.image_ref != image_ref {
+        return None;
+    }
+    let config_path = cached.overlaybd_config_path;
+    match std::fs::metadata(&config_path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+            println!(
+                "Reusing cached rootfs image config {} for {image_ref}",
+                config_path.display()
+            );
+            Some(config_path)
+        }
+        _ => None,
+    }
+}
+
+fn store_rootfs_image_config(
+    app_config: &agentenv::cfg::AppConfig,
+    image_ref: &str,
+    overlaybd_config_path: &Path,
+) {
+    let cache_path = rootfs_image_cache_path(app_config);
+    let cached = CachedRootfsImage {
+        image_ref: image_ref.to_string(),
+        overlaybd_config_path: overlaybd_config_path.to_path_buf(),
+    };
+    let write = || -> Result<()> {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let bytes = serde_json::to_vec_pretty(&cached).context("serialize rootfs image cache")?;
+        std::fs::write(&cache_path, bytes)
+            .with_context(|| format!("write {}", cache_path.display()))?;
+        Ok(())
+    };
+    if let Err(error) = write() {
+        eprintln!("Could not record rootfs image config cache: {error:#}");
+    }
+}
+
+async fn resolve_rootfs_image_config(app_config: &agentenv::cfg::AppConfig) -> Result<PathBuf> {
+    let image_resolver = ImageResolver::new(app_config);
+    let image_ref = image_resolver.default_image().to_string();
+    if let Some(config_path) = cached_rootfs_image_config(app_config, &image_ref) {
+        return Ok(config_path);
+    }
+
+    let resolved = image_resolver.resolve(&image_ref).await?;
+    store_rootfs_image_config(app_config, &image_ref, &resolved.overlaybd_config_path);
+    Ok(resolved.overlaybd_config_path)
+}
+
 async fn fresh_sandbox_config(mem_size_mib: u32) -> Result<FirecrackerSandboxConfig> {
     let app_config = agentenv::cfg::ConfigManager::init_global()?.config();
     let image_config_path = DEFAULT_ROOTFS_IMAGE_CONFIG
-        .get_or_try_init(|| async {
-            let image_resolver = ImageResolver::new(app_config);
-            image_resolver
-                .resolve(image_resolver.default_image())
-                .await
-                .map(|resolved| resolved.overlaybd_config_path)
-        })
+        .get_or_try_init(|| resolve_rootfs_image_config(app_config))
         .await?
         .clone();
     UblkDeviceManager::init_global_from_config(app_config)
