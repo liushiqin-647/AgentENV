@@ -744,3 +744,10 @@ bounded samples; set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY`
 defaults to twice the available CPU parallelism, up to 50. A failed operation
 fails the batch; the benchmark attempts to stop any remaining sandboxes and
 reports cleanup errors.
+
+For profiling, set `AENV_BENCH_PERF_CTL` to the FIFO passed to
+`perf record -D -1 --control=fifo:...` and optionally `AENV_BENCH_PERF_ACK` to
+its ack FIFO. The benchmark then enables sampling only around the timed region
+of the latency cases (`snapshot_creation*`, `snapshot_resume*`,
+`concurrent_resume`), so setup and teardown contribute no samples. Leaving both
+variables unset keeps the previous behavior.

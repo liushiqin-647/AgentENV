@@ -7,11 +7,13 @@ use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Barrier,
+    Arc, Barrier, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -63,6 +65,11 @@ const FULL_THROUGHPUT_MEASUREMENT_TIME: Duration = Duration::from_secs(30);
 const HEAVY_DATA_SIZE_MIB: u32 = 1024;
 const HEAVY_MEM_SIZE_MIB: u32 = HEAVY_DATA_SIZE_MIB + 512;
 const BENCH_UPPER_MODE_ENV: &str = "AENV_BENCH_UPPER_MODE";
+/// Enables perf sampling only inside the timed region. Points at the FIFO
+/// passed to `perf record --control=fifo:...`.
+const BENCH_PERF_CTL_ENV: &str = "AENV_BENCH_PERF_CTL";
+/// Optional ack FIFO used to wait until perf applied the last command.
+const BENCH_PERF_ACK_ENV: &str = "AENV_BENCH_PERF_ACK";
 
 fn bench_upper_mode() -> UpperMode {
     match std::env::var(BENCH_UPPER_MODE_ENV) {
@@ -80,6 +87,69 @@ fn bench_upper_mode() -> UpperMode {
 
 fn full_bench_mode() -> bool {
     std::env::var_os("AENV_BENCH_FULL").is_some()
+}
+
+/// Toggles `perf record --control=fifo:...` around the timed region so setup
+/// and teardown never contribute samples.
+struct PerfGate {
+    ctl: Mutex<File>,
+    ack: Option<Mutex<BufReader<File>>>,
+    users: AtomicU64,
+}
+
+struct PerfGateGuard(Arc<PerfGate>);
+
+impl PerfGate {
+    fn from_env() -> Option<Self> {
+        let ctl_path = std::env::var(BENCH_PERF_CTL_ENV).ok()?;
+        let ctl = OpenOptions::new()
+            .write(true)
+            .open(&ctl_path)
+            .unwrap_or_else(|err| panic!("open {ctl_path}: {err}"));
+        let ack = std::env::var(BENCH_PERF_ACK_ENV).ok().map(|path| {
+            let file = File::open(&path).unwrap_or_else(|err| panic!("open {path}: {err}"));
+            Mutex::new(BufReader::new(file))
+        });
+        Some(Self {
+            ctl: Mutex::new(ctl),
+            ack,
+            users: AtomicU64::new(0),
+        })
+    }
+
+    fn command(&self, command: &str) {
+        let mut ctl = self.ctl.lock().expect("perf control fifo");
+        writeln!(ctl, "{command}").expect("write perf control fifo");
+        ctl.flush().expect("flush perf control fifo");
+        if let Some(ack) = &self.ack {
+            let mut line = String::new();
+            ack.lock()
+                .expect("perf ack fifo")
+                .read_line(&mut line)
+                .expect("read perf ack fifo");
+        }
+    }
+
+    fn enter(self: &Arc<Self>) -> PerfGateGuard {
+        if self.users.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.command("enable");
+        }
+        PerfGateGuard(Arc::clone(self))
+    }
+}
+
+impl Drop for PerfGateGuard {
+    fn drop(&mut self) {
+        if self.0.users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.command("disable");
+        }
+    }
+}
+
+fn perf_gate() -> Option<&'static Arc<PerfGate>> {
+    static GATE: OnceLock<Option<Arc<PerfGate>>> = OnceLock::new();
+    GATE.get_or_init(|| PerfGate::from_env().map(Arc::new))
+        .as_ref()
 }
 
 fn throughput_concurrency() -> Result<usize> {
@@ -412,9 +482,11 @@ fn bench_snapshot_creation_inner(
                 let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib)).unwrap();
                 prepare(&rt, &sandbox).unwrap();
 
+                let guard = perf_gate().map(|gate| gate.enter());
                 let start = std::time::Instant::now();
                 let _snapshot = rt.block_on(async { sandbox.pause().await.unwrap() });
                 total += start.elapsed();
+                drop(guard);
 
                 rt.block_on(async {
                     let _ = sandbox.stop().await;
@@ -483,6 +555,7 @@ fn bench_snapshot_resume(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
+                let guard = perf_gate().map(|gate| gate.enter());
                 let start = std::time::Instant::now();
                 let mut sandbox = rt.block_on(async {
                     FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
@@ -490,6 +563,7 @@ fn bench_snapshot_resume(c: &mut Criterion) {
                         .unwrap()
                 });
                 total += start.elapsed();
+                drop(guard);
 
                 rt.block_on(async {
                     let _ = sandbox.stop().await;
@@ -523,6 +597,7 @@ fn bench_snapshot_resume_cold(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
+                let guard = perf_gate().map(|gate| gate.enter());
                 let start = std::time::Instant::now();
                 let mut sandbox = rt.block_on(async {
                     FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
@@ -530,6 +605,7 @@ fn bench_snapshot_resume_cold(c: &mut Criterion) {
                         .unwrap()
                 });
                 total += start.elapsed();
+                drop(guard);
 
                 rt.block_on(async {
                     let _ = sandbox.stop().await;
@@ -587,6 +663,7 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
                                 break;
                             }
 
+                            let guard = perf_gate().map(|gate| gate.enter());
                             let start = std::time::Instant::now();
                             let mut sandbox = handle.block_on(async {
                                 FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
@@ -594,6 +671,7 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
                                     .unwrap()
                             });
                             resume_latency_total += start.elapsed();
+                            drop(guard);
 
                             handle.block_on(async {
                                 let _ = sandbox.stop().await;
@@ -640,9 +718,11 @@ fn default_snapshot_creation_inner(
         let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib))?;
         prepare(rt, &sandbox)?;
 
+        let guard = perf_gate().map(|gate| gate.enter());
         let start = std::time::Instant::now();
         rt.block_on(async { sandbox.pause().await })?;
         samples.push(start.elapsed());
+        drop(guard);
 
         rt.block_on(async {
             let _ = sandbox.stop().await;
@@ -671,10 +751,12 @@ fn default_snapshot_resume_cold(rt: &Runtime) -> Result<Vec<Duration>> {
     let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
 
     for _ in 0..DEFAULT_SAMPLE_COUNT {
+        let guard = perf_gate().map(|gate| gate.enter());
         let start = std::time::Instant::now();
         let mut sandbox = rt
             .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })?;
         samples.push(start.elapsed());
+        drop(guard);
 
         rt.block_on(async {
             let _ = sandbox.stop().await;
@@ -692,10 +774,12 @@ fn default_snapshot_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
 
     for _ in 0..DEFAULT_SAMPLE_COUNT {
+        let guard = perf_gate().map(|gate| gate.enter());
         let start = std::time::Instant::now();
         let mut sandbox = rt
             .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })?;
         samples.push(start.elapsed());
+        drop(guard);
 
         rt.block_on(async {
             let _ = sandbox.stop().await;
@@ -727,11 +811,13 @@ fn run_concurrent_resume_samples(
 
                 start_barrier.wait();
                 for _ in 0..sample_count {
+                    let guard = perf_gate().map(|gate| gate.enter());
                     let start = std::time::Instant::now();
                     let mut sandbox = handle.block_on(async {
                         FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await
                     })?;
                     samples.push(start.elapsed());
+                    drop(guard);
 
                     handle.block_on(async {
                         let _ = sandbox.stop().await;
