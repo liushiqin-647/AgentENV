@@ -15,13 +15,15 @@
 - 并发用例通过引用计数合并窗口，不会相互关闭
 - 未设置上述环境变量时，行为与改动前完全一致
 
-执行前确认工作区包含该改动：
+**必须使用 `dev_perf` 分支**：门控代码只存在于该分支，`dev` 分支没有。
+
+执行前确认：
 
 ```bash
 cd /path/to/AgentENV
-git status --short crates/benchmarks/benches/snapshot_benchmark.rs
-# 应显示 M（已修改或已提交均可，只要包含 AENV_BENCH_PERF_CTL 的实现）
-grep -n "AENV_BENCH_PERF_CTL" crates/benchmarks/benches/snapshot_benchmark.rs
+git switch dev_perf          # 门控代码在此分支
+grep -c "AENV_BENCH_PERF_CTL" crates/benchmarks/benches/snapshot_benchmark.rs
+# 输出应 >= 1；为 0 说明分支不对
 ```
 
 ## 1. 前置检查
@@ -88,30 +90,34 @@ cp config/default.toml /tmp/aenv-perf/config.toml
 cd /path/to/AgentENV
 
 mkfifo /tmp/perf.ctl /tmp/perf.ack
-chmod 666 /tmp/perf.ctl /tmp/perf.ack   # bench 为普通用户，perf 为 root
-
-# 仅在二进制不在默认 deps 路径时才需要
-# export AENV_CONFIG_PATH=/tmp/aenv-perf/config.toml
-export AENV_HOME_PATH=/tmp/aenv-perf/home
-export AENV_RUNTIME_PATH=/tmp/aenv-perf/run
-# 必须与替换自建二进制时使用的 deps 目录一致
-export AENV_DEPS_PATH=/var/lib/aenv/deps
+chmod 666 /tmp/perf.ctl /tmp/perf.ack   # bench 以非 root 运行，perf 以 root 运行
 
 # ARM 上为 AARCH64_UNKNOWN_LINUX_GNU；不要写死 x86_64
 HOST_ENV=$(rustc -vV | sed -n 's/^host: //p' | tr '[:lower:]-' '[:upper:]_')
+CARGO_BIN=$(command -v cargo)
 
-sudo -E perf record \
-  -g --call-graph dwarf \
-  -e cpu-clock -F 999 \
-  -D -1 --control=fifo:/tmp/perf.ctl,/tmp/perf.ack \
-  -o /tmp/aenv-perf/perf.data -- \
-  env AENV_BENCH_FULL=1 \
-      AENV_BENCH_PERF_CTL=/tmp/perf.ctl \
-      AENV_BENCH_PERF_ACK=/tmp/perf.ack \
-      CARGO_TARGET_${HOST_ENV}_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
-      cargo bench -p agentenv-benchmarks --bench snapshot -- \
-      '^snapshot_creation$' --profile-time 120
+# 所有 AENV_* 都通过 env 内联传入，不依赖 sudo -E（sudoers 可能清空变量）
+sudo env \
+  HOME="$HOME" PATH="$PATH" \
+  CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+  RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+  AENV_HOME_PATH=/tmp/aenv-perf/home \
+  AENV_RUNTIME_PATH=/tmp/aenv-perf/run \
+  AENV_DEPS_PATH=/var/lib/aenv/deps \
+  AENV_BENCH_FULL=1 \
+  AENV_BENCH_PERF_CTL=/tmp/perf.ctl \
+  AENV_BENCH_PERF_ACK=/tmp/perf.ack \
+  CARGO_TARGET_${HOST_ENV}_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  perf record \
+    -g --call-graph dwarf \
+    -e cpu-clock -F 999 \
+    -D -1 --control=fifo:/tmp/perf.ctl,/tmp/perf.ack \
+    -o /tmp/aenv-perf/perf.data -- \
+    "$CARGO_BIN" bench -p agentenv-benchmarks --bench snapshot -- \
+    '^snapshot_creation$' --profile-time 120
 ```
+
+> 二进制不在默认 deps 路径时，在上面的 `env` 列表中再加一行 `AENV_CONFIG_PATH=/tmp/aenv-perf/config.toml`。
 
 参数要点：
 
@@ -137,9 +143,11 @@ sudo -E perf record \
 
 注意：
 
-- 必须 `sudo` 运行 perf；bench 本身不提权，由 runner 负责
-- `-E` 用于把环境变量传给 sudo
-- 顺序不能反：perf 必须包裹 bench 启动，否则 FIFO 打开会阻塞
+- 必须 `sudo` 运行 perf；bench 自身以非 root 运行（`run-with-capabilities.sh` 通过 `setpriv` 赋予 `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`）
+- 全部 `AENV_*` 通过 `env` 内联传入，不要依赖 `sudo -E`
+- 顺序不能反：perf 必须是 bench 的父进程，否则 FIFO 打开会阻塞
+- 首次运行需要解析默认镜像（会访问 registry），后续命中 `$AENV_HOME_PATH/benchmarks/rootfs-image.json` 缓存
+- `^concurrent_resume$` 固定使用 50 并发沙箱（不受 `AENV_BENCH_CONCURRENCY` 影响），资源不足时会跳过该用例
 
 ## 5. 结果分析
 
@@ -152,7 +160,9 @@ sudo perf report -i /tmp/aenv-perf/perf.data --stdio \
 
 - 出现 `firecracker` 且样本数 > 0 → 子进程已覆盖
 - 总样本数为 0 → 门控未生效，见第 6 节
-- bench 的 stderr 中应出现多次 enable/disable 提示，数量与迭代次数同量级
+- 门控本身**不打印任何日志**（bench 静默写 FIFO），只能通过样本数量与 `comm` 分布判断是否生效
+- 交叉验证：`sudo perf script -i /tmp/aenv-perf/perf.data | wc -l`，应远大于 0 且只覆盖若干段短时间窗口
+- 数据里会混入约 1 秒的预热窗口：`--profile-time` 模式下 criterion 先跑 1 秒预热，门控在预热迭代里同样生效。占比很小，不单独剔除
 
 ### 5.2 用户态 / 内核态占比
 
@@ -180,19 +190,23 @@ sudo perf script -i /tmp/aenv-perf/perf.data | \
 
 ### 5.4 可选：精确计数器
 
-若 `cycles` 可用且 `perf stat` 支持 `--control`：
+若 `cycles` 可用且 `perf stat` 支持 `--control`，把第 4 节的 `perf record ...` 换成：
 
 ```bash
-sudo perf stat -e task-clock,cycles:u,cycles:k \
-  -D -1 --control=fifo:/tmp/perf.ctl \
-  -- env AENV_BENCH_FULL=1 AENV_BENCH_PERF_CTL=/tmp/perf.ctl \
-     CARGO_TARGET_${HOST_ENV}_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
-     cargo bench -p agentenv-benchmarks --bench snapshot -- \
-     '^snapshot_creation$' --profile-time 60
+sudo env HOME="$HOME" PATH="$PATH" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+  RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+  AENV_HOME_PATH=/tmp/aenv-perf/home AENV_RUNTIME_PATH=/tmp/aenv-perf/run \
+  AENV_DEPS_PATH=/var/lib/aenv/deps \
+  AENV_BENCH_FULL=1 AENV_BENCH_PERF_CTL=/tmp/perf.ctl \
+  CARGO_TARGET_${HOST_ENV}_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  perf stat -e task-clock,cycles:u,cycles:k \
+    -D -1 --control=fifo:/tmp/perf.ctl \
+    -- "$CARGO_BIN" bench -p agentenv-benchmarks --bench snapshot -- \
+    '^snapshot_creation$' --profile-time 60
 ```
 
 - 用户态占比 = `cycles:u / (cycles:u + cycles:k)`
-- 平均并行度 = `cycles:u / task-clock`
+- 平均并行度 = `task-clock / seconds time elapsed`（后者由 `perf stat` 输出）
 
 ## 6. 故障排查
 
